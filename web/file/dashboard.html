@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P 文件传输工具 - 主界面</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div class="dashboard-container">
+        <!-- 顶部栏 -->
+        <div class="top-bar">
+            <div class="top-bar-left">
+                <h2>P2P 文件传输工具</h2>
+                <span id="myId" class="my-id"></span>
+            </div>
+            <div class="top-bar-right">
+                <span id="connectionStatus" class="status connected">已连接</span>
+                <span id="transportMode" class="mode-badge mode-relay">WebSocket 中继</span>
+                <button id="logoutBtn" onclick="logout()">退出</button>
+            </div>
+        </div>
+
+        <!-- 浮动菜单 -->
+        <div id="clientMenu" class="client-menu" style="display:none;">
+            <button id="p2pConnectBtn" class="menu-btn" onclick="connectP2P()">🔗 P2P 连接</button>
+        </div>
+
+        <div class="main-content">
+            <!-- 左侧：客户端列表 -->
+            <div class="client-panel">
+                <div class="panel-header">
+                    <h3>在线客户端</h3>
+                    <span id="clientCount" class="client-count">0</span>
+                </div>
+                <div id="clientList" class="client-list">
+                    <div class="empty-hint">暂无在线客户端</div>
+                </div>
+            </div>
+
+            <!-- 右侧：操作面板 -->
+            <div class="action-panel">
+                <!-- 选择的目标客户端 -->
+                <div id="targetInfo" class="target-info" style="display:none;">
+                    发送给: <span id="targetName"></span>
+                </div>
+
+                <!-- 文本发送区域 -->
+                <div class="section">
+                    <div class="section-header">
+                        <h3>发送文本</h3>
+                        <span id="textCount" class="char-count">0 / 40860</span>
+                    </div>
+                    <div class="text-input-area">
+                        <textarea id="textInput" placeholder="请输入要发送的文本内容..." maxlength="40860" oninput="updateTextCount()"></textarea>
+                    </div>
+                    <div class="section-actions">
+                        <button id="sendTextBtn" onclick="sendText()" disabled>发送文本</button>
+                    </div>
+                </div>
+
+                <!-- 文件发送区域 -->
+                <div class="section">
+                    <div class="section-header">
+                        <h3>发送文件</h3>
+                    </div>
+                    
+                    <!-- 拖拽区域 -->
+                    <div id="dropZone" class="drop-zone" ondragover="handleDragOver(event)" ondrop="handleDrop(event)" ondragleave="handleDragLeave(event)">
+                        <div class="drop-zone-icon">📁</div>
+                        <div class="drop-zone-text">拖拽文件到此处</div>
+                        <div class="drop-zone-hint">或点击下方按钮选择文件</div>
+                    </div>
+
+                    <!-- 文件选择 -->
+                    <div class="file-select-area">
+                        <input type="file" id="fileInput" onchange="handleFileSelect(event)" style="display:none;">
+                        <button class="file-select-btn" onclick="document.getElementById('fileInput').click()">选择文件</button>
+                        <span id="fileName" class="file-name"></span>
+                    </div>
+
+                    <!-- 文件信息 -->
+                    <div id="fileInfo" class="file-info" style="display:none;">
+                        <div class="file-info-row">
+                            <span class="file-info-label">文件名:</span>
+                            <span id="selectedFileName"></span>
+                        </div>
+                        <div class="file-info-row">
+                            <span class="file-info-label">大小:</span>
+                            <span id="selectedFileSize"></span>
+                        </div>
+                    </div>
+
+                    <div class="section-actions">
+                        <button id="sendFileBtn" onclick="sendFile()" disabled>发送文件</button>
+                    </div>
+                </div>
+
+                <!-- 传输进度区域 -->
+                <div id="progressSection" class="section" style="display:none;">
+                    <div class="section-header">
+                        <h3>传输进度</h3>
+                    </div>
+                    <div id="progressList" class="progress-list"></div>
+                </div>
+
+                <!-- 消息区域 -->
+                <div id="messageSection" class="section" style="display:none;">
+                    <div class="section-header">
+                        <h3>消息</h3>
+                    </div>
+                    <div id="messageList" class="message-list"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/websocket.js"></script>
+    <script src="js/webrtc.js"></script>
+    <script src="js/transport.js"></script>
+    <script src="js/dashboard.js"></script>
+</body>
+</html>
