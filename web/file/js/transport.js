@@ -1,10 +1,13 @@
 // 传输层抽象 - 统一 WebSocket 和 WebRTC 接口
 // WebRTC 连接需要用户手动触发，不再自动连接
-// 依赖: websocket.js (sendMessage), webrtc.js (createOffer, handleOffer, handleAnswer, handleIceCandidate, isWebRTCSupported, sendViaWebRTC)
+// 依赖: websocket.js (sendMessage, sendBinaryMessage), webrtc.js (createOffer, handleOffer, handleAnswer, handleIceCandidate, isWebRTCSupported, sendViaWebRTC, sendViaWebRTCBinary)
 
 let currentMode = 'websocket';  // 'websocket' | 'webrtc'
 let targetClientId = null;
 let messageHandlers = {};
+
+// 二进制消息处理器（目前仅 file_chunk type=2）
+let binaryMessageHandlers = {};
 
 // 传输模式回调
 let onModeChangeCallback = null;
@@ -38,7 +41,7 @@ function deselectTarget() {
     targetClientId = null;
 }
 
-// 发送消息 - 自动选择最佳传输方式
+// 发送文本消息 - 自动选择最佳传输方式
 function transportSend(data) {
     // 优先尝试 WebRTC
     if (currentMode === 'webrtc' && targetClientId) {
@@ -64,12 +67,37 @@ function transportSend(data) {
     return false;
 }
 
-// 注册消息处理器
+// 发送二进制消息 - 自动选择最佳传输方式（用于 file_chunk）
+function transportSendBinary(arrayBuffer) {
+    // 优先尝试 WebRTC
+    if (currentMode === 'webrtc' && targetClientId) {
+        if (typeof sendViaWebRTCBinary === 'function') {
+            const success = sendViaWebRTCBinary(targetClientId, arrayBuffer);
+            if (success) return true;
+            console.log('WebRTC binary send failed, falling back to WebSocket');
+            setMode('websocket');
+        }
+    }
+    
+    // 回退到 WebSocket
+    if (typeof sendBinaryMessage === 'function') {
+        return sendBinaryMessage(arrayBuffer);
+    }
+    
+    return false;
+}
+
+// 注册文本消息处理器
 function transportOnMessage(type, handler) {
     messageHandlers[type] = handler;
 }
 
-// 分发接收到的消息（包括 WebRTC 信令）
+// 注册二进制消息处理器
+function transportOnBinaryMessage(type, handler) {
+    binaryMessageHandlers[type] = handler;
+}
+
+// 分发接收到的文本消息（包括 WebRTC 信令）
 function transportHandleMessage(data) {
     // WebRTC 信令消息直接路由到 webrtc.js
     if (data.type === 'webrtc_offer') {
@@ -97,6 +125,22 @@ function transportHandleMessage(data) {
     }
 }
 
+// 分发接收到的二进制消息（目前仅 file_chunk）
+function transportHandleBinaryMessage(arrayBuffer) {
+    const decoded = decodeFileChunk(arrayBuffer);
+    if (!decoded) {
+        console.error('Failed to decode binary chunk');
+        return;
+    }
+    
+    const handler = binaryMessageHandlers[decoded.type];
+    if (handler) {
+        handler(decoded);
+    } else {
+        console.warn('No handler for binary message type:', decoded.type);
+    }
+}
+
 // 设置传输模式
 function setMode(mode) {
     if (mode === currentMode) return;
@@ -119,7 +163,6 @@ function onTransportModeChange(callback) {
 }
 
 // ===== WebRTC 事件回调注册 =====
-// 这些会在 webrtc.js 加载后被调用
 
 // WebRTC 连接成功
 window.onWebRTCConnected = function(clientId) {
@@ -145,10 +188,14 @@ window.onWebRTCDisconnected = function(clientId) {
     }
 };
 
-// WebRTC 消息到达
+// WebRTC 文本消息到达
 window.onWebRTCMessage = function(data) {
-    // 通过 transport 层分发
     transportHandleMessage(data);
+};
+
+// WebRTC 二进制消息到达
+window.onWebRTCBinaryMessage = function(arrayBuffer) {
+    transportHandleBinaryMessage(arrayBuffer);
 };
 
 // 传输模式状态变化（更新 UI）

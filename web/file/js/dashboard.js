@@ -38,15 +38,18 @@ document.addEventListener('DOMContentLoaded', function() {
         initWebSocket();
     }
     
-    // 注册消息处理器（通过 transport 层）
+    // 注册文本消息处理器（通过 transport 层）
+    // file_meta、file_complete 走 JSON 文本（保留 to 路由字段）
     transportOnMessage('auth_result', handleAuthResult);
     transportOnMessage('client_list', handleClientList);
     transportOnMessage('text', handleTextMessage);
     transportOnMessage('file_meta', handleFileMeta);
-    transportOnMessage('file_chunk', handleFileChunk);
     transportOnMessage('file_progress', handleFileProgress);
     transportOnMessage('file_complete', handleFileComplete);
     transportOnMessage('error', handleError);
+    
+    // 注册二进制消息处理器（仅 file_chunk 走二进制直传，无 Base64）
+    transportOnBinaryMessage(BINARY_TYPE.FILE_CHUNK, handleBinaryFileChunk);
     
     // 注册传输模式变更回调（更新 UI）
     onTransportModeChange(function(mode) {
@@ -394,6 +397,7 @@ function formatFileSize(bytes) {
     return (bytes / Math.pow(1024, i)).toFixed(2) + ' ' + units[i];
 }
 
+// ===== 文件发送（二进制协议版） =====
 function sendFile() {
     if (!selectedClientId) {
         showMessage('请先选择一个目标客户端');
@@ -414,7 +418,7 @@ function sendFile() {
     // 添加进度条
     addProgressItem(currentFileId, selectedFile.name, selectedFile.size);
     
-    // 发送文件元信息（通过 transport 层）
+    // file_meta 走 JSON 文本（包含 to 路由字段，服务端需要用来转发）
     transportSend({
         type: 'file_meta',
         to: selectedClientId,
@@ -426,7 +430,7 @@ function sendFile() {
     // 开始发送文件数据
     setTimeout(function() {
         startFileTransfer(currentFileId);
-    }, 100);
+    }, 10);
     
     // 禁用发送按钮
     document.getElementById('sendFileBtn').disabled = true;
@@ -436,7 +440,7 @@ function generateFileId() {
     return 'file_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
 }
 
-// ===== 文件分块发送 =====
+// ===== 文件分块发送（二进制直传，无 Base64 编码，无延时） =====
 function startFileTransfer(fileId) {
     const reader = new FileReader();
     let offset = 0;
@@ -447,19 +451,9 @@ function startFileTransfer(fileId) {
         const arrayBuffer = e.target.result;
         const bytes = new Uint8Array(arrayBuffer);
         
-        let binary = '';
-        for (let i = 0; i < bytes.length; i++) {
-            binary += String.fromCharCode(bytes[i]);
-        }
-        const base64Data = btoa(binary);
-        
-        // 通过 transport 层发送数据块
-        transportSend({
-            type: 'file_chunk',
-            fileid: fileId,
-            offset: offset,
-            data: base64Data
-        });
+        // 直接二进制编码发送（无 Base64，无 JSON 包裹）
+        const packet = encodeFileChunk(fileId, offset, bytes);
+        transportSendBinary(packet);
         
         // 更新发送进度
         const sent = offset + bytes.length;
@@ -470,11 +464,14 @@ function startFileTransfer(fileId) {
         offset += bytes.length;
         
         if (offset < file.size) {
+            // 立即读取下一块（无 setTimeout 延迟）
             readNextChunk(file, offset, fileId, startTime);
         } else {
-            // 文件发送完成，发送 file_complete 消息
+            // 文件发送完成，file_complete 走 JSON 文本
+            console.log('文件发送完成: ' + file.name + ' (' + formatFileSize(file.size) + ')');
             transportSend({
                 type: 'file_complete',
+                to: selectedClientId,
                 fileid: fileId,
                 filename: file.name,
                 filesize: file.size
@@ -499,19 +496,9 @@ function readNextChunk(file, offset, fileId, startTime) {
         const arrayBuffer = e.target.result;
         const bytes = new Uint8Array(arrayBuffer);
         
-        let binary = '';
-        for (let i = 0; i < bytes.length; i++) {
-            binary += String.fromCharCode(bytes[i]);
-        }
-        const base64Data = btoa(binary);
-        
-        // 通过 transport 层发送数据块
-        transportSend({
-            type: 'file_chunk',
-            fileid: fileId,
-            offset: offset,
-            data: base64Data
-        });
+        // 直接二进制编码发送（无 Base64）
+        const packet = encodeFileChunk(fileId, offset, bytes);
+        transportSendBinary(packet);
         
         const newOffset = offset + bytes.length;
         
@@ -521,13 +508,14 @@ function readNextChunk(file, offset, fileId, startTime) {
         updateProgress(fileId, newOffset, file.size, speed);
         
         if (newOffset < file.size) {
-            setTimeout(function() {
-                readNextChunk(file, newOffset, fileId, startTime);
-            }, 50);
+            // 无延迟，立即发送下一块
+            readNextChunk(file, newOffset, fileId, startTime);
         } else {
-            // 文件发送完成，发送 file_complete 消息
+            // 文件发送完成，file_complete 走 JSON 文本
+            console.log('文件发送完成: ' + file.name + ' (' + formatFileSize(file.size) + ')');
             transportSend({
                 type: 'file_complete',
+                to: selectedClientId,
                 fileid: fileId,
                 filename: file.name,
                 filesize: file.size
@@ -597,7 +585,9 @@ function handleTextMessage(data) {
     messageList.scrollTop = messageList.scrollHeight;
 }
 
+// JSON 文本方式接收 file_meta（保留原有逻辑，包含 from 路由信息）
 function handleFileMeta(data) {
+    console.log('收到来自 ' + (data.from_name || data.from) + ' 的文件: ' + data.filename + ' (' + formatFileSize(data.filesize) + ')');
     showMessage('收到来自 ' + (data.from_name || data.from) + ' 的文件: ' + data.filename + ' (' + formatFileSize(data.filesize) + ')');
     document.getElementById('progressSection').style.display = 'block';
     
@@ -613,32 +603,17 @@ function handleFileMeta(data) {
     addProgressItem(data.fileid, data.filename, data.filesize);
 }
 
-function handleFileChunk(data) {
-    // 存储收到的数据块
-    if (receivedFileChunks[data.fileid]) {
-        receivedFileChunks[data.fileid].push({ offset: data.offset, data: data.data });
-        receivedFiles[data.fileid].receivedSize += data.data.length;
-    }
-    
-    const textEl = document.getElementById('text_' + data.fileid);
-    if (textEl) {
-        const text = textEl.textContent;
-        const parts = text.split(' / ');
-        if (parts.length === 2) {
-            const totalStr = parts[1];
-            let total = 0;
-            const totalParts = totalStr.split(' ');
-            if (totalParts.length === 2) {
-                const val = parseFloat(totalParts[0]);
-                const unit = totalParts[1];
-                if (unit === 'B') total = val;
-                else if (unit === 'KB') total = val * 1024;
-                else if (unit === 'MB') total = val * 1024 * 1024;
-                else if (unit === 'GB') total = val * 1024 * 1024 * 1024;
-            }
-            if (total > 0) {
-                updateProgress(data.fileid, data.offset + data.data.length, total, '');
-            }
+// 二进制方式接收 file_chunk（无 Base64 解码，直接存储 Uint8Array）
+function handleBinaryFileChunk(decoded) {
+    // 存储收到的数据块（data 已经是 Uint8Array，不需要 Base64 解码）
+    if (receivedFileChunks[decoded.fileId]) {
+        receivedFileChunks[decoded.fileId].push({ offset: decoded.offset, data: decoded.data });
+        receivedFiles[decoded.fileId].receivedSize += decoded.dataLen;
+        
+        // 更新进度
+        const fileInfo = receivedFiles[decoded.fileId];
+        if (fileInfo && fileInfo.filesize > 0) {
+            updateProgress(decoded.fileId, decoded.offset + decoded.dataLen, fileInfo.filesize, '');
         }
     }
 }
@@ -647,7 +622,9 @@ function handleFileProgress(data) {
     updateProgress(data.fileid, data.sent, data.total, data.speed);
 }
 
+// JSON 文本方式接收 file_complete
 function handleFileComplete(data) {
+    console.log('文件接收完成: ' + data.filename + ' (' + formatFileSize(data.filesize || 0) + ')');
     // 文件接收完成，提示用户保存
     const fileInfo = receivedFiles[data.fileid];
     if (fileInfo) {
@@ -683,7 +660,7 @@ function showDownloadButton(fileId, filename, filesize) {
     item.appendChild(downloadDiv);
 }
 
-// 下载接收到的文件
+// 下载接收到的文件（二进制版 - 直接拼接 Uint8Array，无 Base64 解码）
 function downloadReceivedFile(fileId) {
     const chunks = receivedFileChunks[fileId];
     const fileInfo = receivedFiles[fileId];
@@ -697,20 +674,19 @@ function downloadReceivedFile(fileId) {
         // 按 offset 排序
         chunks.sort((a, b) => a.offset - b.offset);
         
-        // 将所有 base64 数据合并
-        let binary = '';
-        for (const chunk of chunks) {
-            binary += atob(chunk.data);
-        }
+        // 计算总大小
+        const totalSize = chunks.reduce((sum, c) => sum + c.data.length, 0);
         
-        // 转换为 Uint8Array
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) {
-            bytes[i] = binary.charCodeAt(i);
+        // 直接拼接 Uint8Array（data 已经是原始二进制，无需 Base64 解码）
+        const result = new Uint8Array(totalSize);
+        let pos = 0;
+        for (const chunk of chunks) {
+            result.set(chunk.data, pos);
+            pos += chunk.data.length;
         }
         
         // 创建 Blob 并下载
-        const blob = new Blob([bytes]);
+        const blob = new Blob([result]);
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -720,11 +696,13 @@ function downloadReceivedFile(fileId) {
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
         
+        console.log('文件已保存: ' + fileInfo.filename);
         showMessage('文件已保存: ' + fileInfo.filename);
         
         // 清理内存
         discardReceivedFile(fileId);
     } catch (e) {
+        console.error('保存文件失败: ' + e.message);
         showMessage('保存文件失败: ' + e.message);
     }
 }

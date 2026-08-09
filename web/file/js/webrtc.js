@@ -30,6 +30,7 @@ function createOffer(targetClientId) {
         const dc = pc.createDataChannel('filetransfer', {
             ordered: true
         });
+        dc.binaryType = 'arraybuffer';
         setupDataChannel(dc, targetClientId);
         dataChannels[targetClientId] = dc;
         
@@ -66,6 +67,7 @@ function handleOffer(fromClientId, sdp) {
     // 处理 DataChannel 打开事件（由对端创建）
     pc.ondatachannel = function(event) {
         const dc = event.channel;
+        dc.binaryType = 'arraybuffer';
         setupDataChannel(dc, fromClientId);
         dataChannels[fromClientId] = dc;
     };
@@ -182,14 +184,23 @@ function setupDataChannel(dc, targetClientId) {
     };
     
     dc.onmessage = function(event) {
-        try {
-            const data = JSON.parse(event.data);
-            // 通过全局消息分发
-            if (window.onWebRTCMessage) {
-                window.onWebRTCMessage(data);
+        // 区分二进制数据和文本 JSON
+        if (event.data instanceof ArrayBuffer) {
+            // 二进制消息 → 路由到二进制协议解析
+            if (window.onWebRTCBinaryMessage) {
+                window.onWebRTCBinaryMessage(event.data);
             }
-        } catch (e) {
-            console.error('DataChannel message parse error:', e);
+        } else if (typeof event.data === 'string') {
+            try {
+                const data = JSON.parse(event.data);
+                if (window.onWebRTCMessage) {
+                    window.onWebRTCMessage(data);
+                }
+            } catch (e) {
+                console.error('DataChannel message parse error:', e);
+            }
+        } else {
+            console.warn('Unknown DataChannel message type:', typeof event.data);
         }
     };
     
@@ -198,7 +209,7 @@ function setupDataChannel(dc, targetClientId) {
     };
 }
 
-// 通过 DataChannel 发送消息
+// 通过 DataChannel 发送文本消息（原有 JSON 消息）
 function sendViaWebRTC(targetClientId, data) {
     const dc = dataChannels[targetClientId];
     if (!dc || dc.readyState !== 'open') {
@@ -210,6 +221,22 @@ function sendViaWebRTC(targetClientId, data) {
         return true;
     } catch (e) {
         console.error('Send via WebRTC failed:', e);
+        return false;
+    }
+}
+
+// 通过 DataChannel 发送二进制消息（新的二进制协议）
+function sendViaWebRTCBinary(targetClientId, arrayBuffer) {
+    const dc = dataChannels[targetClientId];
+    if (!dc || dc.readyState !== 'open') {
+        return false;
+    }
+    
+    try {
+        dc.send(arrayBuffer);
+        return true;
+    } catch (e) {
+        console.error('Send binary via WebRTC failed:', e);
         return false;
     }
 }

@@ -13,6 +13,7 @@ function initWebSocket() {
     const wsUrl = protocol + '//' + window.location.host + '/ws';
     
     ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
     
     ws.onopen = function() {
         console.log('WebSocket 连接已建立');
@@ -30,14 +31,24 @@ function initWebSocket() {
     };
     
     ws.onmessage = function(event) {
-        try {
-            const data = JSON.parse(event.data);
-            // 所有消息统一由 transport 层分发
-            if (typeof transportHandleMessage === 'function') {
-                transportHandleMessage(data);
+        // 区分二进制数据和文本 JSON
+        if (event.data instanceof ArrayBuffer) {
+            // 二进制消息 → 路由到二进制协议处理
+            if (typeof transportHandleBinaryMessage === 'function') {
+                transportHandleBinaryMessage(event.data);
             }
-        } catch (e) {
-            console.error('解析消息失败:', e);
+        } else if (typeof event.data === 'string') {
+            try {
+                const data = JSON.parse(event.data);
+                // 所有文本消息统一由 transport 层分发
+                if (typeof transportHandleMessage === 'function') {
+                    transportHandleMessage(data);
+                }
+            } catch (e) {
+                console.error('解析消息失败:', e);
+            }
+        } else {
+            console.warn('Unknown WebSocket message type:', typeof event.data);
         }
     };
     
@@ -65,10 +76,20 @@ function initWebSocket() {
     };
 }
 
-// 发送消息
+// 发送文本消息（原有 JSON 消息）
 function sendMessage(data) {
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(data));
+        return true;
+    }
+    console.error('WebSocket 未连接');
+    return false;
+}
+
+// 发送二进制消息（新的二进制协议）
+function sendBinaryMessage(arrayBuffer) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(arrayBuffer);
         return true;
     }
     console.error('WebSocket 未连接');

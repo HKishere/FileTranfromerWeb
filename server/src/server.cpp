@@ -313,6 +313,7 @@ void Server::onWebSocketMessage(int fd, const WebSocketFrame& frame) {
             } else if (type == "webrtc_offer" || type == "webrtc_answer" || type == "webrtc_ice") {
                 handleWebRTCSignaling(fd, type, message);
             } else if (type == "file_chunk") {
+                // 保留 JSON 格式 file_chunk 兼容（旧客户端）
                 std::string fileId = parseJson(message, "fileid");
                 std::string offsetStr = parseJson(message, "offset");
                 std::string data = parseJson(message, "data");
@@ -321,6 +322,10 @@ void Server::onWebSocketMessage(int fd, const WebSocketFrame& frame) {
             }
             break;
         }
+        case WebSocketOpcode::BINARY:
+            // file_chunk 二进制协议 — 透传，不做编解码
+            handleBinaryFileChunk(fd, frame.payloadData);
+            break;
         case WebSocketOpcode::PING:
             m_wsServer.sendPong(fd, frame.payloadData);
             break;
@@ -543,6 +548,81 @@ void Server::handleFileChunk(int fd, const std::string& fileId, uint64_t offset,
         std::cout << "File transfer complete: " << ftInfo.fileName << std::endl;
         m_fileTransfers.erase(fileId);
     }
+}
+
+// ===== 二进制 file_chunk 中继（新增） =====
+// 解析二进制协议头中的 fileId，查找 FileTransferInfo，找到目标客户端后原样透传整个二进制包
+// 协议格式： [1B type=0x02][2B fileIdLen][N bytes fileId UTF-8][8B offset][4B dataLen][data]
+void Server::handleBinaryFileChunk(int fd, const std::vector<uint8_t>& payload) {
+    if (payload.size() < 1 + 2 + 1 + 8 + 4) {
+        std::cerr << "Binary chunk too short, ignoring" << std::endl;
+        return;
+    }
+
+    size_t pos = 0;
+
+    // type: 1 byte
+    uint8_t type = payload[pos]; pos += 1;
+    if (type != 0x02) {
+        std::cerr << "Unknown binary type: " << (int)type << std::endl;
+        return;
+    }
+
+    // fileIdLen: 2 bytes (little-endian)
+    uint16_t fileIdLen = payload[pos] | (static_cast<uint16_t>(payload[pos + 1]) << 8);
+    pos += 2;
+
+    if (payload.size() < 1 + 2 + fileIdLen + 8 + 4) {
+        std::cerr << "Binary chunk header incomplete" << std::endl;
+        return;
+    }
+
+    // fileId: N bytes (UTF-8)
+    std::string fileId(payload.begin() + pos, payload.begin() + pos + fileIdLen);
+    pos += fileIdLen;
+
+    // offset: 8 bytes (little-endian uint64)
+    uint64_t offset = 0;
+    for (int i = 0; i < 8; i++) {
+        offset |= static_cast<uint64_t>(payload[pos + i]) << (i * 8);
+    }
+    pos += 8;
+
+    // dataLen: 4 bytes (little-endian uint32)
+    uint32_t dataLen = payload[pos] | (static_cast<uint32_t>(payload[pos + 1]) << 8)
+                     | (static_cast<uint32_t>(payload[pos + 2]) << 16)
+                     | (static_cast<uint32_t>(payload[pos + 3]) << 24);
+    pos += 4;
+
+    // 验证数据长度
+    if (payload.size() < pos + dataLen) {
+        std::cerr << "Binary chunk data length mismatch" << std::endl;
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    // 查找文件传输记录
+    auto ftIt = m_fileTransfers.find(fileId);
+    if (ftIt == m_fileTransfers.end()) {
+        // 没有记录（可能是新连接或 WebRTC 直连跳过了服务端 meta 记录），尝试从客户端列表推断
+        // 不做编解码，直接透传二进制给目标客户端
+        std::cerr << "No transfer record for fileId: " << fileId << ", routing by sender" << std::endl;
+        return;
+    }
+
+    auto& ftInfo = ftIt->second;
+    ftInfo.bytesSent += dataLen;
+
+    // 查找目标客户端
+    auto targetIt = m_clientIdToFd.find(ftInfo.toClientId);
+    if (targetIt == m_clientIdToFd.end()) return;
+
+    // 原样透传二进制数据给目标客户端（不做 Base64 编解码）
+    m_wsServer.sendBinary(targetIt->second, payload);
+
+    std::cout << "Binary chunk relayed (fileId=" << fileId << ", offset=" << offset
+              << ", dataLen=" << dataLen << ")" << std::endl;
 }
 
 void Server::broadcastClientList() {
