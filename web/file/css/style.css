@@ -518,6 +518,12 @@ body {
     text-align: right;
 }
 
+/* 接收完成（已显示下载按钮） */
+.progress-item.progress-complete {
+    background: #f1f9f2;
+    border-left: 3px solid #4caf50;
+}
+
 /* 下载操作按钮 */
 .download-action {
     display: flex;

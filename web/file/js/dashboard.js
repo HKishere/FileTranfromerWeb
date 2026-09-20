@@ -1,6 +1,7 @@
 // 存储接收中的文件数据
-let receivedFiles = {};  // fileid -> { chunks: [], filename, filesize, receivedSize }
+let receivedFiles = {};  // fileid -> { chunks: [], filename, filesize, receivedSize, finished }
 let receivedFileChunks = {}; // fileid -> [{offset, data}]
+let discardedFileIds = {};   // fileid -> true（已保存/已丢弃，用于忽略迟到的分片）
 
 // 主页面 JavaScript
 
@@ -587,55 +588,182 @@ function handleTextMessage(data) {
 
 // JSON 文本方式接收 file_meta（保留原有逻辑，包含 from 路由信息）
 function handleFileMeta(data) {
-    console.log('收到来自 ' + (data.from_name || data.from) + ' 的文件: ' + data.filename + ' (' + formatFileSize(data.filesize) + ')');
-    showMessage('收到来自 ' + (data.from_name || data.from) + ' 的文件: ' + data.filename + ' (' + formatFileSize(data.filesize) + ')');
+    const fileName = data.filename || '未命名文件';
+    const fileSize = Number(data.filesize) || 0;
+
+    console.log('收到来自 ' + (data.from_name || data.from) + ' 的文件: ' + fileName + ' (' + formatFileSize(fileSize) + ')');
+    showMessage('收到来自 ' + (data.from_name || data.from) + ' 的文件: ' + fileName + ' (' + formatFileSize(fileSize) + ')');
     document.getElementById('progressSection').style.display = 'block';
-    
+
     // 初始化接收文件存储
-    receivedFiles[data.fileid] = {
-        filename: data.filename,
-        filesize: data.filesize,
-        chunks: [],
-        receivedSize: 0
-    };
-    receivedFileChunks[data.fileid] = [];
-    
-    addProgressItem(data.fileid, data.filename, data.filesize);
+    let fileInfo = receivedFiles[data.fileid];
+    if (!fileInfo) {
+        fileInfo = {
+            filename: fileName,
+            filesize: fileSize,
+            from: data.from,
+            fromName: data.from_name || data.from,
+            chunks: [],
+            receivedSize: 0,
+            finished: false,
+            metaReceived: true
+        };
+        receivedFiles[data.fileid] = fileInfo;
+        receivedFileChunks[data.fileid] = [];
+        addProgressItem(data.fileid, fileName, fileSize);
+    } else {
+        // 分片先到（占位记录已存在）：补全元信息并保留已收到的数据
+        fileInfo.filename = fileName;
+        fileInfo.filesize = fileSize;
+        fileInfo.from = data.from;
+        fileInfo.fromName = data.from_name || data.from;
+        fileInfo.metaReceived = true;
+
+        const nameEl = document.querySelector('.progress-item#progress_' + data.fileid + ' .progress-filename');
+        if (nameEl) nameEl.textContent = fileName;
+    }
+
+    // 空文件没有数据分片，直接显示下载按钮
+    if (fileSize === 0) {
+        tryFinalizeReceive(data.fileid);
+    } else {
+        // 数据可能已经先到齐，补一次完成判定
+        tryFinalizeReceive(data.fileid);
+    }
 }
 
 // 二进制方式接收 file_chunk（无 Base64 解码，直接存储 Uint8Array）
 function handleBinaryFileChunk(decoded) {
-    // 存储收到的数据块（data 已经是 Uint8Array，不需要 Base64 解码）
-    if (receivedFileChunks[decoded.fileId]) {
-        receivedFileChunks[decoded.fileId].push({ offset: decoded.offset, data: decoded.data });
-        receivedFiles[decoded.fileId].receivedSize += decoded.dataLen;
-        
-        // 更新进度
-        const fileInfo = receivedFiles[decoded.fileId];
-        if (fileInfo && fileInfo.filesize > 0) {
-            updateProgress(decoded.fileId, decoded.offset + decoded.dataLen, fileInfo.filesize, '');
-        }
+    // 记录已丢弃（receivedFileChunks 中被 delete）/ 已保存的 fileId，忽略其迟到的分片
+    if (discardedFileIds[decoded.fileId]) {
+        console.warn('忽略已丢弃文件的二进制分片: ' + decoded.fileId);
+        return;
     }
+
+    if (!receivedFiles[decoded.fileId]) {
+        // 极少数情况下 file_meta 尚未到达（或丢失），先补一条记录，保证数据不丢、进度可显示
+        console.warn('收到未声明文件的二进制分片，自动补建记录: ' + decoded.fileId);
+        receivedFiles[decoded.fileId] = {
+            filename: '未命名文件',
+            filesize: 0,
+            from: '',
+            fromName: '',
+            chunks: [],
+            receivedSize: 0,
+            finished: false,
+            metaReceived: false
+        };
+        receivedFileChunks[decoded.fileId] = [];
+        document.getElementById('progressSection').style.display = 'block';
+        addProgressItem(decoded.fileId, receivedFiles[decoded.fileId].filename, 0);
+    }
+
+    // 存储收到的数据块（data 已经是 Uint8Array，不需要 Base64 解码）
+    receivedFileChunks[decoded.fileId].push({ offset: decoded.offset, data: decoded.data });
+    receivedFiles[decoded.fileId].receivedSize += decoded.dataLen;
+
+    // 更新进度
+    const fileInfo = receivedFiles[decoded.fileId];
+    if (fileInfo && fileInfo.filesize > 0) {
+        updateProgress(decoded.fileId, decoded.offset + decoded.dataLen, fileInfo.filesize, '');
+    }
+
+    // 兜底：当接收到的字节数已等于文件大小时，直接显示下载按钮
+    // （服务端未推送 file_complete 时也能正常保存文件）
+    tryFinalizeReceive(decoded.fileId);
 }
 
 function handleFileProgress(data) {
     updateProgress(data.fileid, data.sent, data.total, data.speed);
 }
 
-// JSON 文本方式接收 file_complete
-function handleFileComplete(data) {
-    console.log('文件接收完成: ' + data.filename + ' (' + formatFileSize(data.filesize || 0) + ')');
-    // 文件接收完成，提示用户保存
-    const fileInfo = receivedFiles[data.fileid];
-    if (fileInfo) {
-        showMessage('文件接收完成: ' + data.filename + ' (' + formatFileSize(fileInfo.filesize) + ')');
-        
-        // 显示下载按钮
-        showDownloadButton(data.fileid, fileInfo.filename, fileInfo.filesize);
+// 统计某个文件已接收到的字节数
+function getReceivedBytes(fileId) {
+    const chunks = receivedFileChunks[fileId];
+    if (!chunks) return 0;
+    let total = 0;
+    for (let i = 0; i < chunks.length; i++) {
+        total += chunks[i].data.length;
     }
-    
-    //removeProgress(data.fileid);
-    
+    return total;
+}
+
+// 数据收齐后统一收口（幂等，可被多个来源重复调用）
+function finalizeReceive(fileId) {
+    const fileInfo = receivedFiles[fileId];
+    if (!fileInfo || fileInfo.finished) return true;
+
+    // 文件大小未知时不能判定"收齐"，等待 file_meta 或完成通知携带大小
+    if (!fileInfo.metaReceived && !(fileInfo.filesize > 0)) return false;
+
+    const received = getReceivedBytes(fileId);
+    if (fileInfo.filesize > 0 && received < fileInfo.filesize) return false;
+    if (fileInfo.filesize <= 0) fileInfo.filesize = received;
+
+    fileInfo.finished = true;
+    console.log('文件接收完成: ' + fileInfo.filename + ' (' + formatFileSize(fileInfo.filesize) + ')');
+
+    const item = document.getElementById('progress_' + fileId);
+    if (item) item.classList.add('progress-complete');
+
+    // 显示下载按钮
+    showDownloadButton(fileId, fileInfo.filename, fileInfo.filesize);
+
+    if (received === fileInfo.filesize) {
+        showMessage('文件接收完成: ' + fileInfo.filename + ' (' + formatFileSize(fileInfo.filesize) + ')');
+    } else {
+        showMessage('文件接收完成: ' + fileInfo.filename + '（已收到 ' +
+            formatFileSize(received) + ' / ' + formatFileSize(fileInfo.filesize) + '，数据可能不完整）');
+    }
+    return true;
+}
+
+// 尝试完成接收；数据尚未收齐时短暂重试（应对消息乱序/分片晚到）
+function tryFinalizeReceive(fileId, attempt) {
+    attempt = attempt || 0;
+
+    const fileInfo = receivedFiles[fileId];
+    if (!fileInfo) return false;
+    if (fileInfo.finished) return true;
+
+    if (finalizeReceive(fileId)) return true;
+
+    // 最多重试 6 次（约 1.5 秒），避免收到完成通知但分片还在路上时按钮不出现
+    if (attempt < 6) {
+        setTimeout(function() {
+            tryFinalizeReceive(fileId, attempt + 1);
+        }, 250);
+    } else {
+        console.warn('文件 ' + fileInfo.filename + ' 数据不完整: ' +
+            getReceivedBytes(fileId) + ' / ' + fileInfo.filesize + ' 字节，未显示下载按钮');
+        showMessage('文件接收不完整: ' + fileInfo.filename + '，未生成下载按钮');
+    }
+    return false;
+}
+
+// JSON 文本方式接收 file_complete（接收方 + 发送方都会收到）
+function handleFileComplete(data) {
+    const fileInfo = receivedFiles[data.fileid];
+
+    if (fileInfo) {
+        // 接收方：显示下载按钮
+        if (data.filename && (!fileInfo.metaReceived || fileInfo.filename === '未命名文件')) {
+            fileInfo.filename = data.filename;
+        }
+        if (data.filesize && !fileInfo.filesize) {
+            fileInfo.filesize = Number(data.filesize) || 0;
+        }
+        // 完成通知本身也携带文件名/大小，可视为元信息已到达
+        if (data.filesize) {
+            fileInfo.metaReceived = true;
+        }
+        tryFinalizeReceive(data.fileid);
+    } else {
+        console.log('传输完成通知（本端为发送方或文件已清理）: ' +
+            (data.filename || data.fileid));
+    }
+
+    // 发送方：清理已发送文件的界面状态
     if (data.fileid === currentFileId) {
         selectedFile = null;
         currentFileId = null;
@@ -648,16 +776,25 @@ function handleFileComplete(data) {
 // 显示下载按钮
 function showDownloadButton(fileId, filename, filesize) {
     const item = document.getElementById('progress_' + fileId);
-    
-    if (!item) return;
-    
+
+    if (!item) {
+        console.error('找不到进度条元素，无法显示下载按钮: progress_' + fileId);
+        showMessage('文件 ' + filename + ' 已接收完成，请刷新页面后重试保存');
+        return;
+    }
+
+    // 避免重复添加
+    if (item.querySelector('.download-action')) return;
+
     // 添加下载按钮
     const downloadDiv = document.createElement('div');
     downloadDiv.className = 'download-action';
-    downloadDiv.innerHTML = 
+    downloadDiv.innerHTML =
         '<button class="download-btn" onclick="downloadReceivedFile(\'' + fileId + '\')">💾 保存文件</button>' +
         '<button class="discard-btn" onclick="discardReceivedFile(\'' + fileId + '\')">🗑️ 丢弃</button>';
     item.appendChild(downloadDiv);
+
+    console.log('下载按钮已显示: ' + filename);
 }
 
 // 下载接收到的文件（二进制版 - 直接拼接 Uint8Array，无 Base64 解码）
@@ -673,9 +810,14 @@ function downloadReceivedFile(fileId) {
     try {
         // 按 offset 排序
         chunks.sort((a, b) => a.offset - b.offset);
-        
-        // 计算总大小
+
+        // 计算总大小，并校验数据是否完整
         const totalSize = chunks.reduce((sum, c) => sum + c.data.length, 0);
+        if (fileInfo.filesize > 0 && totalSize !== fileInfo.filesize) {
+            console.warn('文件数据不完整: ' + totalSize + ' / ' + fileInfo.filesize + ' 字节');
+            showMessage('警告: ' + fileInfo.filename + ' 数据不完整（' +
+                formatFileSize(totalSize) + ' / ' + formatFileSize(fileInfo.filesize) + '），仍将保存');
+        }
         
         // 直接拼接 Uint8Array（data 已经是原始二进制，无需 Base64 解码）
         const result = new Uint8Array(totalSize);
@@ -713,6 +855,7 @@ function handleError(data) {
 
 // 丢弃接收到的文件（清理内存）
 function discardReceivedFile(fileId) {
+    discardedFileIds[fileId] = true;
     delete receivedFiles[fileId];
     delete receivedFileChunks[fileId];
     

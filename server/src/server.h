@@ -61,6 +61,8 @@ private:
                         uint64_t fileSize, const std::string& fileId);
     void handleWebRTCSignaling(int fd, const std::string& type, const std::string& message);
     void handleFileChunk(int fd, const std::string& fileId, uint64_t offset, const std::string& data);
+    void handleFileComplete(int fd, const std::string& toClientId, const std::string& fileId,
+                            const std::string& fileName, uint64_t fileSize);
     void handleBinaryFileChunk(int fd, const std::vector<uint8_t>& payload);
     void broadcastClientList();
     std::string generateClientId();

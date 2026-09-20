@@ -319,6 +319,17 @@ void Server::onWebSocketMessage(int fd, const WebSocketFrame& frame) {
                 std::string data = parseJson(message, "data");
                 uint64_t offset = std::stoull(offsetStr);
                 handleFileChunk(fd, fileId, offset, data);
+            } else if (type == "file_complete") {
+                // 发送方声明的传输完成 —— 转发给接收方（接收方据此显示下载按钮）
+                std::string toId = parseJson(message, "to");
+                std::string fileId = parseJson(message, "fileid");
+                std::string fileName = parseJson(message, "filename");
+                std::string fileSizeStr = parseJson(message, "filesize");
+                uint64_t fileSize = 0;
+                if (!fileSizeStr.empty()) {
+                    try { fileSize = std::stoull(fileSizeStr); } catch (...) { fileSize = 0; }
+                }
+                handleFileComplete(fd, toId, fileId, fileName, fileSize);
             }
             break;
         }
@@ -550,11 +561,73 @@ void Server::handleFileChunk(int fd, const std::string& fileId, uint64_t offset,
     }
 }
 
+// ===== 发送方 file_complete 转发（新增） =====
+// 发送方在最后一个二进制分片之后发送 JSON file_complete，服务端据此通知接收方
+// 接收方需要该消息才会显示"保存文件"下载按钮
+void Server::handleFileComplete(int fd, const std::string& toClientId, const std::string& fileId,
+                                const std::string& fileName, uint64_t fileSize) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    auto it = m_clients.find(fd);
+    if (it == m_clients.end()) return;
+
+    std::string fromId = it->second.id;
+    std::string fromName = it->second.name;
+    std::string targetId = toClientId;
+
+    std::string realFileName = fileName;
+    uint64_t realFileSize = fileSize;
+
+    auto ftIt = m_fileTransfers.find(fileId);
+    if (ftIt != m_fileTransfers.end()) {
+        // 服务端已收到 file_meta：以服务端记录为准做校验
+        if (targetId.empty()) targetId = ftIt->second.toClientId;
+        if (realFileName.empty()) realFileName = ftIt->second.fileName;
+        if (realFileSize == 0) realFileSize = ftIt->second.fileSize;
+
+        // 二进制分片尚未全部到达：不提前通知，由 handleBinaryFileChunk 在收齐后通知
+        if (ftIt->second.bytesSent < ftIt->second.fileSize) {
+            std::cout << "file_complete received early (fileId=" << fileId
+                      << ", " << ftIt->second.bytesSent << "/" << ftIt->second.fileSize
+                      << " bytes), waiting for remaining chunks" << std::endl;
+            return;
+        }
+        ftIt->second.complete = true;
+    }
+
+    if (targetId.empty()) {
+        std::cerr << "file_complete without target (fileId=" << fileId << ")" << std::endl;
+        return;
+    }
+
+    auto targetIt = m_clientIdToFd.find(targetId);
+    if (targetIt == m_clientIdToFd.end()) {
+        std::cerr << "file_complete target not found: " << targetId << std::endl;
+        return;
+    }
+
+    std::string completeMsg = "{\"type\":\"file_complete\",\"from\":\"" + fromId
+        + "\",\"from_name\":\"" + fromName
+        + "\",\"fileid\":\"" + fileId
+        + "\",\"filename\":\"" + realFileName
+        + "\",\"filesize\":" + std::to_string(realFileSize) + "}";
+
+    if (targetIt->second != fd) {
+        m_wsServer.sendText(targetIt->second, completeMsg);
+    }
+    // 回执给发送方，便于发送方清理界面状态
+    m_wsServer.sendText(fd, completeMsg);
+
+    std::cout << "File transfer complete (signalled by sender): " << realFileName << std::endl;
+    m_fileTransfers.erase(fileId);
+}
+
 // ===== 二进制 file_chunk 中继（新增） =====
 // 解析二进制协议头中的 fileId，查找 FileTransferInfo，找到目标客户端后原样透传整个二进制包
 // 协议格式： [1B type=0x02][2B fileIdLen][N bytes fileId UTF-8][8B offset][4B dataLen][data]
 void Server::handleBinaryFileChunk(int fd, const std::vector<uint8_t>& payload) {
-    if (payload.size() < 1 + 2 + 1 + 8 + 4) {
+    // header 最小长度 = 1B type + 2B fileIdLen + 8B offset + 4B dataLen（fileId 允许为空）
+    if (payload.size() < 1 + 2 + 8 + 4) {
         std::cerr << "Binary chunk too short, ignoring" << std::endl;
         return;
     }
@@ -580,6 +653,11 @@ void Server::handleBinaryFileChunk(int fd, const std::vector<uint8_t>& payload) 
     // fileId: N bytes (UTF-8)
     std::string fileId(payload.begin() + pos, payload.begin() + pos + fileIdLen);
     pos += fileIdLen;
+
+    if (payload.size() < pos + 8 + 4) {
+        std::cerr << "Binary chunk header incomplete" << std::endl;
+        return;
+    }
 
     // offset: 8 bytes (little-endian uint64)
     uint64_t offset = 0;
@@ -623,6 +701,26 @@ void Server::handleBinaryFileChunk(int fd, const std::vector<uint8_t>& payload) 
 
     std::cout << "Binary chunk relayed (fileId=" << fileId << ", offset=" << offset
               << ", dataLen=" << dataLen << ")" << std::endl;
+
+    // 收齐全部数据后通知 接收方 + 发送方 传输完成
+    // 接收方依赖该消息显示"保存文件"下载按钮
+    if (!ftInfo.complete && ftInfo.bytesSent >= ftInfo.fileSize) {
+        ftInfo.complete = true;
+
+        std::string completeMsg = "{\"type\":\"file_complete\",\"from\":\"" + ftInfo.fromClientId
+            + "\",\"fileid\":\"" + fileId
+            + "\",\"filename\":\"" + ftInfo.fileName
+            + "\",\"filesize\":" + std::to_string(ftInfo.fileSize) + "}";
+
+        if (targetIt->second != fd) {
+            m_wsServer.sendText(targetIt->second, completeMsg);
+        }
+        m_wsServer.sendText(fd, completeMsg);
+
+        std::cout << "File transfer complete: " << ftInfo.fileName
+                  << " (" << ftInfo.fileSize << " bytes)" << std::endl;
+        m_fileTransfers.erase(ftIt);
+    }
 }
 
 void Server::broadcastClientList() {
