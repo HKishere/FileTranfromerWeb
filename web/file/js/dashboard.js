@@ -736,7 +736,7 @@ function tryFinalizeReceive(fileId, attempt) {
     } else {
         console.warn('文件 ' + fileInfo.filename + ' 数据不完整: ' +
             getReceivedBytes(fileId) + ' / ' + fileInfo.filesize + ' 字节，未显示下载按钮');
-        showMessage('文件接收不完整: ' + fileInfo.filename + '，未生成下载按钮');
+        //showMessage('文件接收不完整: ' + fileInfo.filename + '，未生成下载按钮');
     }
     return false;
 }
@@ -757,7 +757,7 @@ function handleFileComplete(data) {
         if (data.filesize) {
             fileInfo.metaReceived = true;
         }
-        tryFinalizeReceive(data.fileid);
+        //tryFinalizeReceive(data.fileid);
     } else {
         console.log('传输完成通知（本端为发送方或文件已清理）: ' +
             (data.filename || data.fileid));
